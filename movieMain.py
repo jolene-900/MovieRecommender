@@ -7,17 +7,20 @@ from sklearn.metrics.pairwise import cosine_similarity
 # --- 1. DATA LOADING & PREPROCESSING (ORIGINAL LOGIC) ---
 @st.cache_data
 def load_data():
-    """All original data cleaning from your script"""
+    """Loads and cleans data exactly as per the original notebook."""
     movies = pd.read_csv("movies_metadata.csv", low_memory=False)
     ratings = pd.read_csv("ratings_small.csv")
     links = pd.read_csv("links_small.csv")
 
-    # Select and clean
+    # Select useful columns
     movies = movies[['id', 'title', 'overview', 'genres', 'release_date', 'vote_average', 'vote_count']]
     movies = movies.dropna(subset=['id', 'title', 'overview'])
+
+    # Convert movie id to numeric
     movies['id'] = pd.to_numeric(movies['id'], errors='coerce')
     movies = movies.dropna(subset=['id']).astype({'id': int})
 
+    # Extract genres
     def extract_genres(genre_str):
         try:
             genre_list = ast.literal_eval(genre_str)
@@ -25,152 +28,166 @@ def load_data():
         except: return ""
 
     movies['genres_clean'] = movies['genres'].apply(extract_genres)
-    
-    # Merge datasets
+
+    # Clean links and merge
     links['tmdbId'] = pd.to_numeric(links['tmdbId'], errors='coerce').dropna().astype(int)
-    merged = pd.merge(links, movies, left_on='tmdbId', right_on='id', how='inner')
-    merged = merged.drop_duplicates(subset='title').reset_index(drop=True)
-    
-    # Feature combination for TF-IDF
-    merged['combined_features'] = (
-        merged['overview'].fillna('') + " " + 
-        (merged['genres_clean'].fillna('') + " ") * 3
+    movies_merged = pd.merge(links, movies, left_on='tmdbId', right_on='id', how='inner')
+    movies_merged = movies_merged.drop_duplicates(subset='title').reset_index(drop=True)
+
+    # Combine features for TF-IDF
+    movies_merged['combined_features'] = (
+        movies_merged['overview'].fillna('') + " " + 
+        (movies_merged['genres_clean'].fillna('') + " ") * 3
     )
-    return merged, ratings
+    return movies_merged, ratings
 
 @st.cache_resource
-def compute_matrices(movies_merged, ratings):
-    """Original similarity calculations"""
-    # Content Similarity
+def compute_similarity(movies_merged, ratings):
+    """Computes similarity matrices for Content and Collaborative filtering."""
+    # TF-IDF for Content-Based
     tfidf = TfidfVectorizer(stop_words='english')
     tfidf_matrix = tfidf.fit_transform(movies_merged['combined_features'])
     cosine_sim = cosine_similarity(tfidf_matrix, tfidf_matrix)
 
-    # Collaborative Similarity
+    # User-Item Matrix for Collaborative
     ratings_movies = pd.merge(ratings, movies_merged, on='movieId', how='inner')
     user_movie_matrix = ratings_movies.pivot_table(index='userId', columns='title', values='rating').fillna(0)
-    movie_sim = cosine_similarity(user_movie_matrix.T)
-    movie_sim_df = pd.DataFrame(movie_sim, index=user_movie_matrix.columns, columns=user_movie_matrix.columns)
+    movie_similarity = cosine_similarity(user_movie_matrix.T)
+    movie_similarity_df = pd.DataFrame(movie_similarity, index=user_movie_matrix.columns, columns=user_movie_matrix.columns)
     
     indices = pd.Series(movies_merged.index, index=movies_merged['title']).drop_duplicates()
-    return cosine_sim, movie_sim_df, indices
+    return cosine_sim, movie_similarity_df, indices
 
-# Initialize State
+# Initialize Data
 movies_merged, ratings_data = load_data()
-cosine_sim, movie_similarity_df, indices = compute_matrices(movies_merged, ratings_data)
+cosine_sim, movie_similarity_df, indices = compute_similarity(movies_merged, ratings_data)
 
-# --- 2. FULL ORIGINAL FEATURE LOGIC ---
+# --- 2. RECOMMENDATION ENGINES (ALL ORIGINAL FUNCTIONS) ---
 
-def get_recommendations(movie_title=None, mode="Hybrid", top_n=10, mood=None, personality=None, hidden_gems=False, alpha=0.5):
-    """Comprehensive recommendation engine including all your original modes"""
-    results = pd.DataFrame()
-
-    if mode == "New User":
-        results = movies_merged.copy()
-        if personality != "None":
-            results = apply_personality_filter(results, personality)
-        if mood != "None":
-            results = apply_mood_filter(results, mood)
-        results = results.sort_values(by=['vote_average', 'vote_count'], ascending=False).query('vote_count > 100')
-        results['explanation'] = "Recommended for new users based on mood/personality."
-
-    elif mode == "Explore":
-        results = hybrid_recommend(movie_title, top_n=20, alpha=0.5)
-        results = results.iloc[5:5+top_n] if len(results) > 5 else results
-        results['explanation'] = "Explore mode: Less obvious but relevant choices."
-
-    elif mode == "Content-Based":
-        results = recommend_content(movie_title, top_n)
-        results['explanation'] = results.apply(lambda r: f"Similar storyline/genres: {r['genres_clean']}.", axis=1)
-
-    elif mode == "Collaborative":
-        results = recommend_collaborative(movie_title, top_n)
-        results['explanation'] = "Based on similar user behavior."
-
-    else: # Hybrid
-        results = hybrid_recommend(movie_title, top_n, alpha)
-        results['explanation'] = "Combined content and collaborative analysis."
-
-    # Applying standard filters
-    if mood != "None" and mode != "New User":
-        results = apply_mood_filter(results, mood)
-    if personality != "None" and mode != "New User":
-        results = apply_personality_filter(results, personality)
-    if hidden_gems:
-        results = results[(results['vote_average'] >= 6.5) & (results['vote_count'] < 500)]
-        
-    return results.head(top_n)
-
-# Original Support Functions
-def recommend_content(title, n):
+def recommend_content(title, top_n=10):
+    if title not in indices: return pd.DataFrame()
     idx = indices[title]
-    scores = sorted(list(enumerate(cosine_sim[idx])), key=lambda x: x[1], reverse=True)[1:n+30]
-    df = pd.DataFrame({'title': [movies_merged.iloc[i[0]]['title'] for i in scores], 'model_score': [i[1] for i in scores]})
-    return pd.merge(df, movies_merged, on='title').query('vote_count > 50')
+    sim_scores = sorted(list(enumerate(cosine_sim[idx])), key=lambda x: x[1], reverse=True)[1:top_n+30]
+    recs = pd.DataFrame({'title': [movies_merged.iloc[i[0]]['title'] for i in sim_scores], 'model_score': [i[1] for i in sim_scores]})
+    return pd.merge(recs, movies_merged, on='title').query('vote_count > 50')
 
-def recommend_collaborative(title, n):
-    scores = movie_similarity_df[title].sort_values(ascending=False)[1:n+30]
-    df = pd.DataFrame({'title': scores.index, 'model_score': scores.values})
-    return pd.merge(df, movies_merged, on='title').query('vote_count > 50')
+def recommend_collaborative(title, top_n=10):
+    if title not in movie_similarity_df.columns: return pd.DataFrame()
+    sim_scores = movie_similarity_df[title].sort_values(ascending=False)[1:top_n+30]
+    recs = pd.DataFrame({'title': sim_scores.index, 'model_score': sim_scores.values})
+    return pd.merge(recs, movies_merged, on='title').query('vote_count > 50')
 
-def hybrid_recommend(title, n, alpha):
-    if title not in indices or title not in movie_similarity_df.columns: return pd.DataFrame()
-    c_recs = recommend_content(title, 100).rename(columns={'model_score': 'c_score'})
-    col_recs = recommend_collaborative(title, 100).rename(columns={'model_score': 'col_score'})
+def hybrid_recommend(movie_title, top_n=10, alpha=0.5):
+    if movie_title not in indices or movie_title not in movie_similarity_df.columns: return pd.DataFrame()
+    c_recs = recommend_content(movie_title, 100).rename(columns={'model_score': 'c_score'})
+    col_recs = recommend_collaborative(movie_title, 100).rename(columns={'model_score': 'col_score'})
     hybrid = pd.merge(c_recs[['title', 'c_score']], col_recs[['title', 'col_score']], on='title', how='outer').fillna(0)
+    # Normalize and Weight
     hybrid['model_score'] = (alpha * (hybrid['c_score']/hybrid['c_score'].max())) + ((1-alpha) * (hybrid['col_score']/hybrid['col_score'].max()))
     return pd.merge(hybrid, movies_merged, on='title').sort_values('model_score', ascending=False)
 
+def get_explore_mode(movie_title, top_n=5):
+    results = hybrid_recommend(movie_title, top_n=20, alpha=0.5)
+    return results.iloc[5:5+top_n] if not results.empty else results
+
+def get_new_user_recommendations(personality=None, mood=None, top_n=10):
+    results = movies_merged.copy()
+    if personality != "None": results = apply_personality_filter(results, personality)
+    if mood != "None": results = apply_mood_filter(results, mood)
+    return results.sort_values(by=['vote_average', 'vote_count'], ascending=False).query('vote_count > 100').head(top_n)
+
+# --- 3. FILTERS & EXPLANATIONS ---
+
 def apply_mood_filter(df, mood):
-    mood_map = {"Happy": ["Comedy", "Family"], "Sad": ["Drama"], "Romantic": ["Romance"], "Excited": ["Action"], "Curious": ["Mystery"], "Scared": ["Horror"], "Relaxed": ["Music"]}
+    mood_map = {"Happy": ["Comedy", "Family", "Animation"], "Sad": ["Drama"], "Romantic": ["Romance"], 
+                "Excited": ["Action", "Adventure"], "Curious": ["Mystery", "Documentary"], "Scared": ["Horror"], "Relaxed": ["Music"]}
     pattern = "|".join(mood_map.get(mood, []))
     return df[df['genres_clean'].str.contains(pattern, case=False, na=False)]
 
-def apply_personality_filter(df, pers):
+def apply_personality_filter(df, personality):
     pers_map = {"Adventurer": ["Adventure"], "Romantic": ["Romance"], "Thinker": ["Science Fiction"], "Fun Lover": ["Comedy"], "Dreamer": ["Fantasy"]}
-    pattern = "|".join(pers_map.get(pers, []))
+    pattern = "|".join(pers_map.get(personality, []))
     return df[df['genres_clean'].str.contains(pattern, case=False, na=False)]
 
-# --- 3. STREAMLIT INTERFACE (THE FRONT END) ---
-st.set_page_config(page_title="Movie Recommender", layout="wide")
-st.sidebar.title("🎬 Menu")
-page = st.sidebar.radio("Navigate", ["Recommendations", "Search Titles", "System Features", "Method Comparison"])
+def explain_recommendation(mode):
+    explanations = {
+        "Content-Based": "Based on similar storyline and genres.",
+        "Collaborative": "Based on what similar users enjoyed.",
+        "Hybrid": "Based on a mix of content and user behavior.",
+        "Explore": "Showing less obvious choices related to your taste.",
+        "New User": "Based on your selected mood and personality preferences."
+    }
+    return explanations.get(mode, "")
+
+# --- 4. STREAMLIT UI ---
+
+st.set_page_config(page_title="Movie Expert System", layout="wide")
+st.sidebar.title("🎬 Navigation")
+page = st.sidebar.radio("Select Page", ["Recommendations", "Search Titles", "Features", "Method Comparison"])
 
 if page == "Recommendations":
-    st.header("🎬 Movie Recommendations")
-    mode = st.selectbox("Mode", ["Hybrid", "Content-Based", "Collaborative", "Explore", "New User"])
-    movie_title = st.selectbox("Select Movie", movies_merged['title'].unique()) if mode != "New User" else None
+    st.header("🎬 Get Your Recommendations")
+    mode = st.selectbox("Method", ["Hybrid", "Content-Based", "Collaborative", "Explore", "New User"])
     
-    col1, col2, col3 = st.columns(3)
-    mood = col1.selectbox("Mood", ["None", "Happy", "Sad", "Romantic", "Excited", "Curious", "Scared", "Relaxed"])
-    pers = col2.selectbox("Personality", ["None", "Adventurer", "Romantic", "Thinker", "Fun Lover", "Dreamer"])
-    top_n = col3.slider("Count", 1, 10, 5)
-    gems = st.checkbox("Hidden Gems Only")
+    movie_title = None
+    if mode != "New User":
+        movie_title = st.selectbox("Which movie do you like?", movies_merged['title'].unique())
 
-    if st.button("Generate"):
-        res = get_recommendations(movie_title, mode, top_n, mood, pers, gems)
+    c1, c2, c3 = st.columns(3)
+    mood = c1.selectbox("Current Mood", ["None", "Happy", "Sad", "Romantic", "Excited", "Curious", "Scared", "Relaxed"])
+    pers = c2.selectbox("Personality Type", ["None", "Adventurer", "Romantic", "Thinker", "Fun Lover", "Dreamer"])
+    top_n = c3.slider("How many movies?", 1, 15, 5)
+    
+    hidden_gems = st.checkbox("Hidden Gems Only (High rating, low vote count)")
+
+    if st.button("Generate Recommendations"):
+        if mode == "Content-Based": res = recommend_content(movie_title, top_n)
+        elif mode == "Collaborative": res = recommend_collaborative(movie_title, top_n)
+        elif mode == "Explore": res = get_explore_mode(movie_title, top_n)
+        elif mode == "New User": res = get_new_user_recommendations(pers, mood, top_n)
+        else: res = hybrid_recommend(movie_title, top_n)
+
+        # Apply common filters
+        if mode != "New User":
+            res = apply_mood_filter(res, mood) if mood != "None" else res
+            res = apply_personality_filter(res, pers) if pers != "None" else res
+        if hidden_gems:
+            res = res[(res['vote_average'] >= 6.5) & (res['vote_count'] < 500)]
+
         if not res.empty:
-            for _, row in res.iterrows():
-                with st.expander(f"🎥 {row['title']} (Score: {row.get('model_score', 'N/A')})"):
-                    st.write(f"**Genres:** {row['genres_clean']} | **Rating:** {row['vote_average']}")
-                    st.write(f"**Why?** {row['explanation']}")
-                    st.write(f"**Plot:** {row['overview']}")
-        else: st.error("No results found.")
+            st.success(f"Why these? {explain_recommendation(mode)}")
+            for _, row in res.head(top_n).iterrows():
+                with st.expander(f"🎥 {row['title']} (Rating: {row['vote_average']})"):
+                    st.write(f"**Genres:** {row['genres_clean']}")
+                    st.write(f"**Score:** {row.get('model_score', 'N/A')}")
+                    st.write(f"**Overview:** {row['overview']}")
+        else: st.warning("No movies found with the current filters.")
 
 elif page == "Search Titles":
-    query = st.text_input("Keyword:")
-    if query:
-        st.table(movies_merged[movies_merged['title'].str.contains(query, case=False)].head(10)[['title', 'genres_clean']])
+    st.header("🔍 Search Movie Titles")
+    search_q = st.text_input("Enter keyword:")
+    if search_q:
+        matches = movies_merged[movies_merged['title'].str.contains(search_q, case=False, na=False)]
+        st.dataframe(matches[['title', 'genres_clean', 'release_date', 'vote_average']].head(20))
 
-elif page == "System Features":
-    st.header("✨ Full System Features")
-    features = ["Content-Based", "Collaborative Filtering", "Hybrid Engine", "Explore Mode", "New User Logic", "Mood Filter", "Personality Filter", "Hidden Gems", "Explainable Recs", "Method Comparison"]
-    for i, f in enumerate(features, 1): st.write(f"{i}. **{f}**")
+elif page == "Features":
+    st.header("✨ System Features")
+    features = [
+        "1. Content-Based", "2. Collaborative Filtering", "3. Hybrid Recommendation", 
+        "4. Explore Mode", "5. New User Recommendation", "6. Mood-Based Filter", 
+        "7. Personality-Based Filter", "8. Hidden Gems", "9. Explainable Recommendation", 
+        "10. Method Comparison"
+    ]
+    for f in features: st.write(f"✅ {f}")
 
 elif page == "Method Comparison":
-    title = st.selectbox("Compare for:", movies_merged['title'].unique())
-    if st.button("Run Comparison"):
-        c1, c2, c3 = st.columns(3)
-        c1.write("**Content**"); c1.table(recommend_content(title, 5)[['title']])
-        c2.write("**Collaborative**"); c2.table(recommend_collaborative(title, 5)[['title']])
-        c3.write("**Hybrid**"); c3.table(hybrid_recommend(title, 5, 0.5)[['title']])
+    st.header("📊 Method Comparison")
+    comp_movie = st.selectbox("Select Movie to Compare", movies_merged['title'].unique())
+    if st.button("Compare Results"):
+        col1, col2, col3 = st.columns(3)
+        col1.write("**Content-Based**")
+        col1.table(recommend_content(comp_movie, 5)[['title']])
+        col2.write("**Collaborative**")
+        col2.table(recommend_collaborative(comp_movie, 5)[['title']])
+        col3.write("**Hybrid**")
+        col3.table(hybrid_recommend(comp_movie, 5)[['title']])
